@@ -1,26 +1,32 @@
 """MCP server exposing the English coaching tools as an Alexa+ Agent Skill."""
 
+import json
+import os
+
+import boto3
 from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("english-coach")
 
+_lambda_client = boto3.client("lambda")
+ORCHESTRATOR_FUNCTION_NAME = os.environ.get("ORCHESTRATOR_FUNCTION_NAME", "")
+
 
 @mcp.tool()
-def analyze_pronunciation(transcript: str, target_phrase: str) -> dict:
-    """Compare what the user said against the target phrase and return feedback.
+def analyze_pronunciation(audio_key: str, target_phrase: str) -> dict:
+    """Analyze a recorded clip against the target phrase via the AWS voice pipeline.
 
     Args:
-        transcript: What the speech-to-text engine heard from the user.
+        audio_key: S3 object key of the audio clip already uploaded to the
+            pipeline's bucket (see `request_upload_url`).
         target_phrase: The phrase the user was asked to say.
     """
-    # Placeholder scoring until real phoneme/acoustic analysis (Bedrock/Strands) is wired in.
-    matches = transcript.strip().lower() == target_phrase.strip().lower()
-    return {
-        "target_phrase": target_phrase,
-        "heard": transcript,
-        "matches": matches,
-        "feedback": "Great job!" if matches else "Close — try slowing down on each syllable.",
-    }
+    response = _lambda_client.invoke(
+        FunctionName=ORCHESTRATOR_FUNCTION_NAME,
+        InvocationType="RequestResponse",
+        Payload=json.dumps({"audio_key": audio_key, "expected_phrase": target_phrase}).encode("utf-8"),
+    )
+    return json.loads(response["Payload"].read())
 
 
 @mcp.tool()

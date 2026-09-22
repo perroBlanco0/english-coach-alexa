@@ -1,0 +1,13 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"text": "Hello"}
+      ]
+    }
+  ],
+  "inferenceConfig": {
+    "maxTokens": 20
+  }
+}
