@@ -12,16 +12,29 @@ import json
 import os
 import time
 import uuid
+from typing import NotRequired, TypedDict
 
 import boto3
 from botocore.client import Config
+from mcp.server.apps import Apps
 from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-mcp = MCPServer("english-coach")
+# MCP Apps (`io.modelcontextprotocol/ui`): `analyze_pronunciation` is bound to a
+# `ui://` card, so a host that negotiates the extension (Alexa+, MCP Inspector)
+# renders the result visually instead of narrating raw JSON. The card's HTML
+# never enters model context — the spec splits `content` (text, for the model)
+# from `structuredContent` (data, for the UI) — so this costs no tokens.
+#
+# The MCPServer is built at the BOTTOM of this module: extensions are consumed
+# eagerly at construction, so `apps` must already hold every UI-bound tool and
+# its HTML resource before the server exists.
+apps = Apps()
+
+FEEDBACK_UI_URI = "ui://english-coach/feedback.html"
 
 AUDIO_BUCKET = os.environ["AUDIO_BUCKET"]
 BEDROCK_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
@@ -63,8 +76,34 @@ DEFAULT_PHRASES = [
 ]
 
 
-@mcp.tool()
-def analyze_pronunciation(audio_key: str, target_phrase: str, user_id: str = "") -> dict:
+class PronunciationResult(TypedDict):
+    """The shape `analyze_pronunciation` returns, declared so the SDK can build
+    an `outputSchema` for it.
+
+    This is what makes the `ui://` card work. Without a typed return the SDK
+    emits no output schema and no `structuredContent` — it serializes the dict
+    into a text block instead, and the card renders empty with no error
+    anywhere. And `structured_output=True` over a bare `dict` doesn't fall
+    back, it fails at import ("return type <class 'dict'> is not serializable
+    for structured output"), taking every tool in this module down with it.
+    """
+
+    audio_key: str
+    expected_phrase: str
+    transcript: str
+    low_confidence_words: list[str]
+    recurring_troubled_words: list[str]
+    feedback: str | None
+    feedback_audio_url: str | None
+    # Only present on the no-speech path, so the card can tell "said nothing"
+    # apart from "said it perfectly".
+    no_speech_detected: NotRequired[bool]
+
+
+@apps.tool(resource_uri=FEEDBACK_UI_URI, structured_output=True)
+def analyze_pronunciation(
+    audio_key: str, target_phrase: str, user_id: str = ""
+) -> PronunciationResult:
     """Analyze a recorded clip (already uploaded to S3) against the target phrase.
 
     Runs the real AWS voice pipeline: Amazon Transcribe -> Amazon Bedrock (feedback)
@@ -123,7 +162,6 @@ def analyze_pronunciation(audio_key: str, target_phrase: str, user_id: str = "")
     }
 
 
-@mcp.tool()
 def suggest_expression(target_phrase: str, level: str = "intermediate") -> dict:
     """Suggest a colloquial expression related to the phrase the user just practiced.
 
@@ -163,7 +201,6 @@ def suggest_expression(target_phrase: str, level: str = "intermediate") -> dict:
     return {"target_phrase": target_phrase, "level": level, "expression": expression}
 
 
-@mcp.tool()
 def generate_phrases(level: str = "intermediate", count: int = 10) -> dict:
     """Generate a batch of practice phrases for pronunciation drills.
 
@@ -351,6 +388,171 @@ def _update_progress(user_id: str, low_confidence_words: list[str]) -> None:
             "updated_at": int(time.time()),
         }
     )
+
+
+# ---- MCP Apps card for `analyze_pronunciation` ----
+#
+# A self-contained HTML document the host renders in a sandboxed iframe. It
+# receives the tool result over postMessage as a JSON-RPC notification
+# (`ui/notifications/tool-result`) and reads `structuredContent` — the same
+# payload `PronunciationResult` describes. No external scripts, fonts or
+# styles, so it renders under a strict CSP without declaring extra domains.
+
+FEEDBACK_HTML = """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pronunciation feedback</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #18181b; --muted: #71717a; --line: #e4e4e7;
+    --bad-bg: #fef2f2; --bad-fg: #b91c1c; --bad-line: #fecaca;
+    --warn-bg: #fffbeb; --warn-fg: #b45309; --accent: #4f46e5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #18181b; --fg: #fafafa; --muted: #a1a1aa; --line: #3f3f46;
+      --bad-bg: #450a0a; --bad-fg: #fca5a5; --bad-line: #7f1d1d;
+      --warn-bg: #451a03; --warn-fg: #fcd34d; --accent: #818cf8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #18181b; --fg: #fafafa; --muted: #a1a1aa; --line: #3f3f46;
+    --bad-bg: #450a0a; --bad-fg: #fca5a5; --bad-line: #7f1d1d;
+    --warn-bg: #451a03; --warn-fg: #fcd34d; --accent: #818cf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  .label {
+    font-size: 11px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+  }
+  .phrase { font-size: 22px; font-weight: 600; margin-bottom: 18px; }
+  .phrase span.bad {
+    background: var(--bad-bg); color: var(--bad-fg);
+    border-bottom: 2px solid var(--bad-line);
+    border-radius: 3px; padding: 0 2px;
+  }
+  .heard {
+    font-size: 15px; color: var(--muted); font-style: italic;
+    padding: 10px 12px; border-left: 3px solid var(--line); margin-bottom: 18px;
+  }
+  .feedback {
+    font-size: 15px; padding: 14px; border: 1px solid var(--line);
+    border-radius: 10px; margin-bottom: 14px;
+  }
+  .recurring {
+    background: var(--warn-bg); color: var(--warn-fg); font-size: 13px;
+    padding: 10px 12px; border-radius: 8px; margin-bottom: 14px;
+  }
+  .recurring b { font-weight: 600; }
+  audio { width: 100%; margin-top: 4px; }
+  .empty { color: var(--muted); font-size: 15px; text-align: center; padding: 28px 12px; }
+  .perfect { color: var(--accent); font-size: 13px; font-weight: 600; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="root">
+  <div class="empty">Esperando el resultado del analisis...</div>
+</div>
+<script>
+  var root = document.getElementById("root");
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Transcribe reports the words it was least confident about. Highlight those
+  // inside the phrase the learner was asked to say, matching on the bare word
+  // so trailing punctuation doesn't stop a match.
+  function renderPhrase(phrase, badWords) {
+    var bad = {};
+    (badWords || []).forEach(function (w) { bad[String(w).toLowerCase()] = true; });
+    return String(phrase || "").split(/(\\s+)/).map(function (token) {
+      var bare = token.replace(/[^A-Za-z']/g, "").toLowerCase();
+      return bare && bad[bare] ? '<span class="bad">' + esc(token) + "</span>" : esc(token);
+    }).join("");
+  }
+
+  function render(data) {
+    if (!data) return;
+
+    if (data.no_speech_detected) {
+      root.innerHTML = '<div class="empty">No se detecto voz en la grabacion.<br>' +
+        "Intenta de nuevo hablando mas cerca del microfono.</div>";
+      return;
+    }
+
+    var bad = data.low_confidence_words || [];
+    var recurring = data.recurring_troubled_words || [];
+    var html = '<div class="label">Frase objetivo</div>' +
+      '<div class="phrase">' + renderPhrase(data.expected_phrase, bad) + "</div>";
+
+    if (data.transcript) {
+      html += '<div class="label">Lo que se escucho</div>' +
+        '<div class="heard">' + esc(data.transcript) + "</div>";
+    }
+
+    if (!bad.length) {
+      html += '<div class="perfect">Sin palabras marcadas como dudosas en este intento.</div>';
+    }
+
+    if (recurring.length) {
+      html += '<div class="recurring">Palabras que repites entre sesiones: <b>' +
+        recurring.map(esc).join(", ") + "</b></div>";
+    }
+
+    if (data.feedback) {
+      html += '<div class="label">Feedback del coach</div>' +
+        '<div class="feedback">' + esc(data.feedback) + "</div>";
+    }
+
+    if (data.feedback_audio_url) {
+      html += '<audio controls preload="none" src="' + esc(data.feedback_audio_url) + '"></audio>';
+    }
+
+    root.innerHTML = html;
+  }
+
+  window.addEventListener("message", function (event) {
+    var msg = event.data;
+    if (!msg || msg.method !== "ui/notifications/tool-result") return;
+    render((msg.params || {}).structuredContent);
+  });
+</script>
+</body>
+</html>
+"""
+
+apps.add_html_resource(
+    FEEDBACK_UI_URI,
+    FEEDBACK_HTML,
+    name="pronunciation-feedback",
+    title="Pronunciation feedback",
+    description=(
+        "Renders one pronunciation attempt: the target phrase with the words "
+        "Transcribe was least confident about highlighted, what was actually "
+        "heard, the coach's Spanish feedback, and its spoken audio."
+    ),
+    prefers_border=True,
+)
+
+# Built last: `_apply_extension` reads `apps.tools()` and `apps.resources()` at
+# construction time, so everything above has to be registered by now.
+mcp = MCPServer("english-coach", extensions=[apps])
+
+# These two carry no card — Alexa renders data-only responses through its own
+# native hydration layer.
+mcp.add_tool(suggest_expression)
+mcp.add_tool(generate_phrases)
 
 
 # ---- Streamable HTTP app, deployed behind a Lambda Function URL ----
