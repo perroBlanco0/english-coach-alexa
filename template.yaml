@@ -1,22 +1,69 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  English Coach voice pipeline: WebSocket API -> Lambda orchestrator ->
-  S3 (temp audio) -> Amazon Transcribe -> Amazon Bedrock.
+  English Coach voice pipeline: WebSocket API -> Lambda orchestrator (MCP client)
+  -> MCP server Lambda (Streamable HTTP, Alexa+ Agent Skill) -> S3 (temp audio) ->
+  Amazon Transcribe -> Amazon Bedrock -> Amazon Polly.
 
 Globals:
   Function:
-    Timeout: 30
+    Timeout: 45
     MemorySize: 256
     Runtime: python3.12
 
 Parameters:
   BedrockModelId:
     Type: String
-    Default: amazon.titan-text-lite-v1
+    Default: amazon.nova-micro-v1:0
     Description: Bedrock model used to evaluate pronunciation and draft feedback.
+  McpSharedSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Shared secret the orchestrator sends as the X-Mcp-Auth header and the MCP
+      server Lambda validates, since its Function URL has no IAM auth.
 
 Resources:
+  UserPoolV2:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: english-coach-users-v2
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClientV2:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPoolV2
+      ClientName: english-coach-web
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  ProgressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "english-coach-progress-${AWS::AccountId}-${AWS::Region}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+
   AudioBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -54,11 +101,35 @@ Resources:
       Environment:
         Variables:
           AUDIO_BUCKET: !Ref AudioBucket
-          BEDROCK_MODEL_ID: !Ref BedrockModelId
           WEBSOCKET_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}"
+          MCP_SERVER_URL: !Sub "${McpServerFunctionUrl.FunctionUrl}mcp"
+          MCP_SHARED_SECRET: !Ref McpSharedSecret
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref AudioBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${WebSocketStage}/POST/@connections/*"
+
+  McpServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: english_coach_mcp.server.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          AUDIO_BUCKET: !Ref AudioBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MCP_SHARED_SECRET: !Ref McpSharedSecret
+          PROGRESS_TABLE: !Ref ProgressTable
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProgressTable
         - Statement:
             - Effect: Allow
               Action:
@@ -71,8 +142,11 @@ Resources:
               Resource: "*"
             - Effect: Allow
               Action:
-                - execute-api:ManageConnections
-              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${WebSocketStage}/POST/@connections/*"
+                - polly:SynthesizeSpeech
+              Resource: "*"
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
 
   ConnectRoute:
     Type: AWS::ApiGatewayV2::Route
@@ -130,6 +204,34 @@ Resources:
       IntegrationType: AWS_PROXY
       IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations"
 
+  SuggestExpressionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: suggest_expression
+      Target: !Sub "integrations/${SuggestExpressionIntegration}"
+
+  SuggestExpressionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations"
+
+  GeneratePhrasesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: generate_phrases
+      Target: !Sub "integrations/${GeneratePhrasesIntegration}"
+
+  GeneratePhrasesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations"
+
   WebSocketLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -138,6 +240,70 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
 
+  # ---- Frontend hosting: private S3 bucket behind CloudFront (OAC) ----
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "english-coach-frontend-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "english-coach-frontend-oac-${AWS::AccountId}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend-s3-origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS Managed-CachingOptimized
+        # SPA routing: unknown paths (client-side routes) fall back to index.html.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
 Outputs:
   WebSocketEndpoint:
     Description: WebSocket URL clients connect to.
@@ -145,6 +311,30 @@ Outputs:
   AudioBucketName:
     Description: S3 bucket holding temporary audio clips.
     Value: !Ref AudioBucket
+  ProgressTableName:
+    Description: DynamoDB table storing per-user pronunciation progress.
+    Value: !Ref ProgressTable
   OrchestratorFunctionArn:
-    Description: ARN of the Lambda orchestrator (used by the MCP server for direct invoke).
+    Description: ARN of the Lambda orchestrator.
     Value: !GetAtt OrchestratorFunction.Arn
+  McpServerUrl:
+    Description: >
+      Public Streamable HTTP endpoint of the MCP server (append the shared
+      secret as an X-Mcp-Auth header to call it directly with an MCP client,
+      e.g. for the friction log / demo evidence).
+    Value: !Sub "${McpServerFunctionUrl.FunctionUrl}mcp"
+  FrontendBucketName:
+    Description: S3 bucket hosting the built SPA (used by frontend/deploy.sh).
+    Value: !Ref FrontendBucket
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (used by frontend/deploy.sh for cache invalidation).
+    Value: !Ref FrontendDistribution
+  FrontendUrl:
+    Description: Public HTTPS URL of the deployed SPA.
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  UserPoolId:
+    Description: Cognito User Pool ID.
+    Value: !Ref UserPoolV2
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID.
+    Value: !Ref UserPoolClientV2

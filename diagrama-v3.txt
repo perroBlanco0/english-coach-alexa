@@ -1,0 +1,78 @@
+v3 — corta la cadena de pago (Bedrock + Polly) cuando Transcribe no detecta
+voz. Base igual a diagrama-v1.2.txt. Cambios marcados con [NUEVO].
+
+┌────────────┐        HTTPS         ┌─────────────┐        origin fetch (OAC)
+│  Browser   │ ───────────────────► │ CloudFront  │ ─────────────────────────► S3 (Frontend SPA)
+│  (SPA)     │                      └─────────────┘
+└─────┬──────┘
+      │ wss:// connect / actions ($connect, request_upload_url, analyze, suggest_expression)
+      ▼
+┌─────────────────────┐   AWS_PROXY   ┌───────────────────────┐
+│ API GW (WebSocket)  │ ────────────► │ OrchestratorFunction   │  (Lambda, cliente MCP)
+└─────────────────────┘               │  - request_upload_url  │
+      ▲                                │  - analyze             │
+      │ post_to_connection (feedback)  │  - suggest_expression  │
+      └────────────────────────────────┴───────────┬────────────┘
+                                                     │
+                        1. presigned PUT url ────────┤
+                        (browser sube audio directo)  │ 2. Streamable HTTP MCP call
+                                                     │    (X-Mcp-Auth shared secret)
+                                                     ▼
+┌──────────────────┐  presigned PUT/GET   ┌────────────────────────────┐
+│  S3 AudioBucket   │ ◄──────────────────► │ McpServerFunction          │
+│  (audio temp +    │                      │ (Lambda, Function URL,    │
+│   feedback-audio) │                      │  MCP server: Streamable   │
+└──────────────────┘                       │  HTTP, Alexa+ Agent Skill)│
+                                            │  tools:                  │
+                                            │  - analyze_pronunciation │
+                                            │  - suggest_expression    │
+                                            └──────────┬───────────────┘
+                                                       │
+                                        StartTranscriptionJob
+                                                       ▼
+                                              ┌──────────────┐
+                                              │  Transcribe  │
+                                              └──────┬───────┘
+                                                      │
+                                     transcript == "" ?
+                                        ┌─────────────┴─────────────┐
+                                        │                           │
+                                       sí [NUEVO]                   no
+                                        │                           │
+                                        ▼                           ▼
+                          ┌────────────────────────┐   ┌──────────────┐│┌──────────┐
+                          │ return no_speech_       │   │   Bedrock    │││  Polly   │
+                          │ detected: true          │   │ (feedback en │││(voz del  │
+                          │ feedback: null           │   │  español)    │││ consejo) │
+                          │ feedback_audio_url: null │   └──────┬───────┘│└────┬─────┘
+                          │ (no se invoca Bedrock     │          │        │     │
+                          │  ni Polly — 0 costo de    │          ▼        │     ▼
+                          │  modelo/voz en este caso) │   ┌──────────────────────────┐
+                          └───────────┬───────────────┘   │ DynamoDB ProgressTable    │
+                                      │                    │ (user_id, errores         │
+                                      │                    │  recurrentes, nivel)      │
+                                      ▼                    └──────────────────────────┘
+                        (misma ruta post_to_connection
+                         de vuelta al browser que el
+                         camino "con voz")
+
+Cambios respecto a v1.2 (diagrama-v1.2.txt):
+[NUEVO] Corte temprano en analyze_pronunciation: si Transcribe devuelve un
+  transcript vacío (silencio, micrófono apagado, permiso denegado), la
+  función retorna de inmediato con no_speech_detected=true y NO llama a
+  Bedrock (feedback) ni a Polly (síntesis de audio) — antes esa cadena
+  completa se ejecutaba igual y producía un consejo inventado sobre
+  palabras que nunca se dijeron. Es el cambio de mayor impacto en costo
+  del lote P1, y corresponde al caso más frecuente en un usuario nuevo.
+[NUEVO] Frontend (fuera de este diagrama, solo UI): el estado
+  no_speech_detected ya no se muestra como un resultado de "0/100" — se
+  renderiza una tarjeta neutra "No alcanzamos a escucharte" con botón
+  "Intentar de nuevo". No agrega nodos ni llamadas nuevas a la
+  arquitectura, así que no se dibuja aquí.
+
+Sin cambios respecto a v1.2: el flujo con voz detectada (Transcribe con
+confidence por palabra + DynamoDB ProgressTable) sigue igual.
+
+Verificado en producción (stack english-coach-alexa, 2026-09-27): prueba
+end-to-end real con audio silencioso confirmó no_speech_detected=true,
+feedback=null, feedback_audio_url=null, en ~19s de punta a punta.

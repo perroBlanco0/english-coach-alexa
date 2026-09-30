@@ -1,0 +1,63 @@
+v1.2 — agrega feedback por palabra (Transcribe confidence) y memoria de
+progreso entre sesiones (DynamoDB). Base igual a diagrama-actual.txt (v1.0).
+Cambios marcados con [NUEVO].
+
+┌────────────┐        HTTPS         ┌─────────────┐        origin fetch (OAC)
+│  Browser   │ ───────────────────► │ CloudFront  │ ─────────────────────────► S3 (Frontend SPA)
+│  (SPA)     │                      └─────────────┘
+└─────┬──────┘
+      │ wss:// connect / actions ($connect, request_upload_url, analyze, suggest_expression)
+      ▼
+┌─────────────────────┐   AWS_PROXY   ┌───────────────────────┐
+│ API GW (WebSocket)  │ ────────────► │ OrchestratorFunction   │  (Lambda, cliente MCP)
+└─────────────────────┘               │  - request_upload_url  │
+      ▲                                │  - analyze             │
+      │ post_to_connection (feedback)  │  - suggest_expression  │
+      └────────────────────────────────┴───────────┬────────────┘
+                                                     │
+                        1. presigned PUT url ────────┤
+                        (browser sube audio directo)  │ 2. Streamable HTTP MCP call
+                                                     │    (X-Mcp-Auth shared secret)
+                                                     ▼
+┌──────────────────┐  presigned PUT/GET   ┌────────────────────────────┐
+│  S3 AudioBucket   │ ◄──────────────────► │ McpServerFunction          │
+│  (audio temp +    │                      │ (Lambda, Function URL,    │
+│   feedback-audio) │                      │  MCP server: Streamable   │
+└──────────────────┘                       │  HTTP, Alexa+ Agent Skill)│
+                                            │  tools:                  │
+                                            │  - analyze_pronunciation │
+                                            │  - suggest_expression    │
+                                            └──┬──────┬──────┬──────┬──┘
+                                               │      │      │      │
+                            StartTranscriptionJob│      │SynthesizeSpeech │
+                            (word-level confidence)│      │              │ [NUEVO]
+                                               ▼      │      ▼           │ PutItem / GetItem
+                                      ┌──────────────┐│┌──────────┐      │ (por user_id)
+                                      │  Transcribe  │││  Polly   │      ▼
+                                      └──────┬───────┘│└──────────┘  ┌──────────────────┐
+                                             │         ▼             │ DynamoDB          │
+                                             │  ┌──────────────┐     │ ProgressTable     │ [NUEVO]
+                                             └─►│   Bedrock    │     │ (user_id, errores │
+                                                │ (feedback en │     │  recurrentes,     │
+                                                │  español,    │     │  nivel, historial)│
+                                                │  con detalle │     └────────┬──────────┘
+                                                │  de palabras │              │
+                                                │  fallidas)   │◄─────────────┘
+                                                └──────────────┘   lee progreso previo
+                                                                    para ajustar dificultad
+                                                                    y priorizar sonidos que
+                                                                    el usuario repite
+
+Cambios respecto a v1.0 (diagrama-actual.txt):
+[NUEVO 1] Transcribe: se usa el confidence score por palabra (ya viene en la
+  respuesta, sin costo extra) para marcar qué palabras específicas fallaron,
+  en vez de solo pasar el transcript completo a Bedrock.
+[NUEVO 2] DynamoDB ProgressTable: nueva tabla (pay-per-request) donde
+  analyze_pronunciation escribe cada sesión (user_id, palabras falladas,
+  nivel) y Bedrock lee el historial antes de generar feedback, para
+  adaptar dificultad y repetir lo que el usuario sigue fallando.
+  Requiere un identificador de usuario (hoy no existe uno persistente —
+  a definir: connectionId no sirve porque cambia por sesión).
+
+Descartado (mencionado, no incluido): tarjeta visual `ui://` — no resuelve
+nada funcional, es solo presentación; queda fuera de esta versión.

@@ -1,0 +1,38 @@
+┌────────────┐        HTTPS         ┌─────────────┐        origin fetch (OAC)
+│  Browser   │ ───────────────────► │ CloudFront  │ ─────────────────────────► S3 (Frontend SPA)
+│  (SPA)     │                      └─────────────┘
+└─────┬──────┘
+      │ wss:// connect / actions ($connect, request_upload_url, analyze, suggest_expression)
+      ▼
+┌─────────────────────┐   AWS_PROXY   ┌───────────────────────┐
+│ API GW (WebSocket)  │ ────────────► │ OrchestratorFunction   │  (Lambda, cliente MCP)
+└─────────────────────┘               │  - request_upload_url  │
+      ▲                                │  - analyze             │
+      │ post_to_connection (feedback)  │  - suggest_expression  │
+      └────────────────────────────────┴───────────┬────────────┘
+                                                     │
+                        1. presigned PUT url ────────┤
+                        (browser sube audio directo)  │ 2. Streamable HTTP MCP call
+                                                     │    (X-Mcp-Auth shared secret)
+                                                     ▼
+┌──────────────────┐  presigned PUT/GET   ┌────────────────────────────┐
+│  S3 AudioBucket   │ ◄──────────────────► │ McpServerFunction          │
+│  (audio temp +    │                      │ (Lambda, Function URL,    │
+│   feedback-audio) │                      │  MCP server: Streamable   │
+└──────────────────┘                       │  HTTP, Alexa+ Agent Skill)│
+                                            │  tools:                  │
+                                            │  - analyze_pronunciation │
+                                            │  - suggest_expression    │
+                                            └─────────┬──────┬──────┬──┘
+                                                       │      │      │
+                                        StartTranscriptionJob│      │SynthesizeSpeech
+                                                       ▼      │      ▼
+                                              ┌──────────────┐│┌──────────┐
+                                              │  Transcribe  │││  Polly   │
+                                              └──────────────┘│└──────────┘
+                                                               ▼
+                                                        ┌──────────────┐
+                                                        │   Bedrock    │
+                                                        │ (feedback en │
+                                                        │  español)    │
+                                                        └──────────────┘
